@@ -287,10 +287,54 @@ app.get('/api/simbolos', ah(async (req, res) => {
   })));
 }));
 
-async function narrarConIA(simbolo, datos, tipo = 'símbolo patrio') {
+// ---------- IA (Google Gemini) ----------
+// Función única para hablar con Gemini. La usan los datos curiosos y el
+// asistente del administrador. Si el modelo principal está ocupado (error 503)
+// o falla, prueba con el modelo de respaldo. Si ninguno responde, devuelve null
+// y quien la llamó usa su propio respaldo, así el juego nunca se rompe.
+function modelosIA() {
+  const lista = [
+    process.env.GEMINI_MODEL,
+    process.env.GEMINI_MODEL_RESPALDO || 'gemini-flash-lite-latest',
+  ].filter(Boolean);
+  return [...new Set(lista)];
+}
+
+const iaConfigurada = () => Boolean(process.env.GEMINI_API_KEY && modelosIA().length);
+
+async function llamarGemini(prompt, { temperatura = 0.7, maxTokens = 800, esperaMs = 15000 } = {}) {
   const key = process.env.GEMINI_API_KEY;
-  const modelo = process.env.GEMINI_MODEL;
-  if (!key || !modelo) return null;
+  if (!key) return null;
+  for (const modelo of modelosIA()) {
+    try {
+      const r = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: temperatura, maxOutputTokens: maxTokens },
+          }),
+          signal: AbortSignal.timeout(esperaMs),
+        }
+      );
+      if (!r.ok) {
+        console.warn(`Gemini (${modelo}) respondió ${r.status}, probando el siguiente modelo`);
+        continue;
+      }
+      const data = await r.json();
+      const partes = data?.candidates?.[0]?.content?.parts || [];
+      const texto = partes.map((p) => p.text || '').join('').trim();
+      if (texto) return texto;
+    } catch (e) {
+      console.warn(`Gemini (${modelo}) no respondió: ${e.message}`);
+    }
+  }
+  return null;
+}
+
+async function narrarConIA(simbolo, datos, tipo = 'símbolo patrio') {
   const lista = datos.map((d) => `- ${d}`).join('\n');
   const prompt =
     'Eres el narrador del juego de memoria "Memory Honduras", para estudiantes. ' +
@@ -298,26 +342,7 @@ async function narrarConIA(simbolo, datos, tipo = 'símbolo patrio') {
     'Elige AL AZAR UNO de estos tres datos y cuéntaselo en UNA sola frase breve ' +
     '(máximo 22 palabras), en español, con tono amigable. No enumeres ni repitas la lista:\n' +
     `${lista}\nResponde únicamente con la frase, sin comillas.`;
-  try {
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 1.0, maxOutputTokens: 120 },
-        }),
-        signal: AbortSignal.timeout(8000),
-      }
-    );
-    if (!r.ok) return null;
-    const data = await r.json();
-    const texto = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return texto && texto.trim() ? texto.trim() : null;
-  } catch (_) {
-    return null;
-  }
+  return llamarGemini(prompt, { temperatura: 1.0, maxTokens: 300, esperaMs: 8000 });
 }
 
 app.get('/api/simbolos/:clave/dato', auth, ah(async (req, res) => {
@@ -443,7 +468,9 @@ app.get('/api/departamentos/:clave/dato', auth, ah(async (req, res) => {
 }));
 
 // ---------- Panel de monitoreo del servidor ----------
-app.get('/api/metricas', auth, soloAdmin, ah(async (req, res) => {
+// Reúne todas las métricas del juego y del servidor en un solo objeto.
+// La usan el panel (/api/metricas) y el asistente de IA del administrador.
+async function obtenerMetricas() {
   const [[u]] = await pool.query('SELECT COUNT(*) AS total FROM usuarios');
   const [[p]] = await pool.query(
     `SELECT COUNT(*) AS total,
@@ -502,7 +529,7 @@ app.get('/api/metricas', auth, soloAdmin, ah(async (req, res) => {
   const totalMB = Math.round(os.totalmem() / 1048576);
   const libreMB = Math.round(os.freemem() / 1048576);
   const n = (v) => Number(v || 0);
-  res.json({
+  return {
     usuarios: n(u.total),
     partidas: {
       total: n(p.total),
@@ -536,10 +563,46 @@ app.get('/api/metricas', auth, soloAdmin, ah(async (req, res) => {
       memoriaLibreMB: libreMB,
       encendidoSeg: Math.round(os.uptime()),
       apiActivaSeg: Math.round(process.uptime()),
-      iaConfigurada: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_MODEL),
+      iaConfigurada: iaConfigurada(),
     },
     generado: new Date().toISOString(),
-  });
+  };
+}
+
+app.get('/api/metricas', auth, soloAdmin, ah(async (req, res) => {
+  res.json(await obtenerMetricas());
+}));
+
+// ---------- Asistente de IA del administrador ----------
+// El administrador escribe una pregunta. El servidor lee las métricas de MySQL
+// en ese momento y se las pasa a Gemini junto con la pregunta, así la respuesta
+// siempre usa los datos actuales.
+app.post('/api/ia/admin/preguntar', auth, soloAdmin, ah(async (req, res) => {
+  const pregunta = String((req.body && req.body.pregunta) || '').trim();
+  if (pregunta.length < 2 || pregunta.length > 500) {
+    return res.status(400).json({ mensaje: 'Escribe una pregunta de entre 2 y 500 caracteres' });
+  }
+  if (!iaConfigurada()) {
+    return res.status(503).json({ mensaje: 'La IA no está configurada en el servidor (revisa GEMINI_API_KEY en .env)' });
+  }
+  const metricas = await obtenerMetricas();
+  const prompt =
+    'Eres el asistente del administrador del juego "Memory Honduras" (un juego de memoria con ' +
+    'símbolos patrios y departamentos de Honduras). Abajo tienes las métricas ACTUALES del juego y ' +
+    'del servidor Rocky Linux, en formato JSON. Los tiempos están en segundos, la memoria en MB y ' +
+    'los montos en lempiras (L).\n\n' +
+    'Reglas:\n' +
+    '- Responde en español, claro y breve (máximo 120 palabras).\n' +
+    '- Usa SOLO los datos del JSON. Si la respuesta no está en los datos, dilo con honestidad.\n' +
+    '- Cuando ayude, da números concretos y una recomendación corta.\n' +
+    '- No uses formato Markdown (sin asteriscos ni almohadillas).\n\n' +
+    `MÉTRICAS:\n${JSON.stringify(metricas)}\n\n` +
+    `PREGUNTA DEL ADMINISTRADOR: ${pregunta}`;
+  const respuesta = await llamarGemini(prompt, { temperatura: 0.4, maxTokens: 1000 });
+  if (!respuesta) {
+    return res.status(503).json({ mensaje: 'La IA está ocupada en este momento, intenta de nuevo en unos segundos' });
+  }
+  res.json({ respuesta, generado: metricas.generado });
 }));
 
 app.get('/', (req, res) => res.redirect('/panel'));
