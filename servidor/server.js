@@ -340,9 +340,12 @@ async function narrarConIA(simbolo, datos, tipo = 'símbolo patrio') {
     'Eres el narrador del juego de memoria "Memory Honduras", para estudiantes. ' +
     `El jugador acaba de encontrar el par de este elemento (${tipo}): "${simbolo.nombre}" (${simbolo.descripcion}).\n` +
     'Elige AL AZAR UNO de estos tres datos y cuéntaselo en UNA sola frase breve ' +
-    '(máximo 22 palabras), en español, con tono amigable. No enumeres ni repitas la lista:\n' +
+    '(máximo 22 palabras), en español, con tono amigable. No enumeres ni repitas la lista. ' +
+    'No empieces con "Dato curioso" ni con un título; ve directo al dato:\n' +
     `${lista}\nResponde únicamente con la frase, sin comillas.`;
-  return llamarGemini(prompt, { temperatura: 1.0, maxTokens: 300, esperaMs: 8000 });
+  const texto = await llamarGemini(prompt, { temperatura: 1.0, maxTokens: 300, esperaMs: 8000 });
+  // Por si la IA igual empieza con "¡Dato curioso!" o "Dato curioso:", se quita.
+  return texto ? texto.replace(/^\s*[¡!]?\s*dato curioso\s*[!:.,\-–—]*\s*/i, '').trim() || null : null;
 }
 
 app.get('/api/simbolos/:clave/dato', auth, ah(async (req, res) => {
@@ -429,6 +432,223 @@ app.post('/api/tienda/comprar', auth, ah(async (req, res) => {
   res.status(201).json({
     mensaje: 'Pago simulado aprobado',
     referencia, producto: p.nombre, monto: Number(p.precio),
+  });
+}));
+
+// ---------- Pago real con PayPal ----------
+// Flujo:
+//  1. La app pide crear una orden (/api/paypal/crear-orden).
+//  2. El servidor crea la orden en PayPal y le devuelve a la app el enlace de pago.
+//  3. El jugador paga en la página oficial de PayPal (con su cuenta o con tarjeta).
+//  4. PayPal lo regresa a /api/paypal/retorno; el servidor confirma (captura) el
+//     cobro con PayPal y guarda la compra en MySQL.
+//  5. Mientras tanto la app pregunta cada pocos segundos /api/paypal/orden/:id.
+// Los datos de la tarjeta se escriben SOLO en la página de PayPal: nunca pasan
+// por la app ni por este servidor.
+// PayPal no acepta lempiras, así que se cobra el equivalente en dólares.
+const PAYPAL_API = process.env.PAYPAL_API_URL || (process.env.PAYPAL_MODE === 'live'
+  ? 'https://api-m.paypal.com'
+  : 'https://api-m.sandbox.paypal.com');
+const paypalConfigurado = () =>
+  Boolean(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET);
+const LEMPIRAS_POR_DOLAR = Number(process.env.LEMPIRAS_POR_DOLAR) || 27.07;
+
+let paypalToken = { valor: null, vence: 0 };
+async function tokenPayPal() {
+  if (paypalToken.valor && Date.now() < paypalToken.vence) return paypalToken.valor;
+  const credenciales = Buffer.from(
+    `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`
+  ).toString('base64');
+  const r = await fetch(`${PAYPAL_API}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${credenciales}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error(`PayPal no aceptó las credenciales (${r.status})`);
+  const data = await r.json();
+  paypalToken = { valor: data.access_token, vence: Date.now() + (data.expires_in - 60) * 1000 };
+  return paypalToken.valor;
+}
+
+async function pedirPayPal(metodoHttp, ruta, cuerpo) {
+  const r = await fetch(`${PAYPAL_API}${ruta}`, {
+    method: metodoHttp,
+    headers: {
+      Authorization: `Bearer ${await tokenPayPal()}`,
+      'Content-Type': 'application/json',
+    },
+    body: cuerpo ? JSON.stringify(cuerpo) : undefined,
+    signal: AbortSignal.timeout(20000),
+  });
+  const data = await r.json().catch(() => ({}));
+  return { ok: r.ok, status: r.status, data };
+}
+
+// URL pública de este servidor (la misma que usó la app para llamarnos).
+function urlServidor(req) {
+  return (process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+}
+
+function paginaPago(titulo, mensaje, exito) {
+  const color = exito ? '#2E7D32' : '#C62828';
+  const icono = exito ? '✔' : '✖';
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>${titulo}</title>
+<style>body{font-family:system-ui,sans-serif;background:#F4F7FF;display:flex;align-items:center;
+justify-content:center;min-height:100vh;margin:0}.c{background:#fff;border-radius:20px;padding:32px;
+max-width:420px;text-align:center;box-shadow:0 6px 24px #0033a022}.i{width:72px;height:72px;border-radius:50%;
+background:${color};color:#fff;font-size:40px;line-height:72px;margin:0 auto 12px}h1{color:${color};margin:8px 0}
+p{color:#5C6B8A}</style></head><body><div class="c"><div class="i">${icono}</div>
+<h1>${titulo}</h1><p>${mensaje}</p><p><b>Ya puedes cerrar esta pestaña y volver a Memory Honduras.</b></p>
+</div></body></html>`;
+}
+
+app.get('/api/paypal/config', (req, res) => {
+  res.json({
+    activo: paypalConfigurado(),
+    modo: process.env.PAYPAL_MODE === 'live' ? 'live' : 'sandbox',
+    lempirasPorDolar: LEMPIRAS_POR_DOLAR,
+  });
+});
+
+app.post('/api/paypal/crear-orden', auth, ah(async (req, res) => {
+  if (!paypalConfigurado()) {
+    return res.status(503).json({ mensaje: 'PayPal no está configurado en el servidor' });
+  }
+  const { clave, metodo } = req.body || {};
+  if (typeof clave !== 'string' || !['tarjeta', 'paypal'].includes(metodo)) {
+    return res.status(400).json({ mensaje: 'Datos de compra no válidos' });
+  }
+  const [prod] = await pool.execute(
+    'SELECT id_producto, nombre, precio, repetible FROM productos WHERE clave = ? AND activo = 1',
+    [clave]
+  );
+  if (prod.length === 0) return res.status(404).json({ mensaje: 'Producto no encontrado' });
+  const p = prod[0];
+  if (p.repetible !== 1) {
+    const [ya] = await pool.execute(
+      `SELECT 1 FROM compras WHERE id_usuario = ? AND id_producto = ? AND estado = 'aprobada' LIMIT 1`,
+      [req.user.id, p.id_producto]
+    );
+    if (ya.length > 0) return res.status(409).json({ mensaje: 'Ya tienes este producto' });
+  }
+  const montoUsd = Math.max(0.01, Math.round((Number(p.precio) / LEMPIRAS_POR_DOLAR) * 100) / 100).toFixed(2);
+  const base = urlServidor(req);
+  const orden = await pedirPayPal('POST', '/v2/checkout/orders', {
+    intent: 'CAPTURE',
+    purchase_units: [{
+      reference_id: clave,
+      description: `Memory Honduras - ${p.nombre}`.slice(0, 127),
+      custom_id: `${req.user.id}:${p.id_producto}`,
+      amount: { currency_code: 'USD', value: montoUsd },
+    }],
+    payment_source: {
+      paypal: {
+        experience_context: {
+          brand_name: 'Memory Honduras',
+          // 'GUEST_CHECKOUT' abre directo el formulario de tarjeta de PayPal.
+          landing_page: metodo === 'tarjeta' ? 'GUEST_CHECKOUT' : 'LOGIN',
+          shipping_preference: 'NO_SHIPPING',
+          user_action: 'PAY_NOW',
+          return_url: `${base}/api/paypal/retorno`,
+          cancel_url: `${base}/api/paypal/cancelado`,
+        },
+      },
+    },
+  });
+  const enlace = (orden.data.links || []).find((l) => l.rel === 'payer-action' || l.rel === 'approve');
+  if (!orden.ok || !orden.data.id || !enlace) {
+    console.error('PayPal no creó la orden:', orden.status, JSON.stringify(orden.data));
+    return res.status(502).json({ mensaje: 'PayPal no pudo crear el pago, intenta de nuevo' });
+  }
+  await pool.execute(
+    `INSERT INTO pagos_paypal (id_orden, id_usuario, id_producto, metodo, monto_hnl, monto_usd)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [orden.data.id, req.user.id, p.id_producto, metodo, p.precio, montoUsd]
+  );
+  res.status(201).json({
+    orden: orden.data.id,
+    url: enlace.href,
+    montoUsd: Number(montoUsd),
+    modo: process.env.PAYPAL_MODE === 'live' ? 'live' : 'sandbox',
+  });
+}));
+
+// PayPal regresa aquí al jugador después de aprobar el pago.
+app.get('/api/paypal/retorno', ah(async (req, res) => {
+  const idOrden = String(req.query.token || '');
+  const [filas] = await pool.execute('SELECT * FROM pagos_paypal WHERE id_orden = ?', [idOrden]);
+  if (filas.length === 0) {
+    return res.status(404).send(paginaPago('Pago no encontrado', 'No reconocemos esta orden de pago.', false));
+  }
+  const pago = filas[0];
+  if (pago.estado === 'completada') {
+    return res.send(paginaPago('¡Pago aprobado!', `Referencia: ${pago.referencia}`, true));
+  }
+  // Se "aparta" la orden para que recargar la página no cobre dos veces.
+  const [apartada] = await pool.execute(
+    `UPDATE pagos_paypal SET estado = 'procesando' WHERE id_orden = ? AND estado = 'creada'`,
+    [idOrden]
+  );
+  if (apartada.affectedRows !== 1) {
+    return res.send(paginaPago('Pago en proceso', 'Tu pago ya se está procesando.', true));
+  }
+  let cobro;
+  try {
+    cobro = await pedirPayPal('POST', `/v2/checkout/orders/${encodeURIComponent(idOrden)}/capture`, {});
+  } catch (e) {
+    cobro = { ok: false, status: 0, data: { message: e.message } };
+  }
+  const captura = cobro.data?.purchase_units?.[0]?.payments?.captures?.[0];
+  const cobrado = Number(captura?.amount?.value);
+  if (!cobro.ok || cobro.data.status !== 'COMPLETED' || !captura ||
+      captura.status !== 'COMPLETED' || cobrado !== Number(pago.monto_usd)) {
+    const detalle = (cobro.data?.details?.[0]?.issue || cobro.data?.message || `HTTP ${cobro.status}`).toString().slice(0, 250);
+    console.error('PayPal no completó el cobro:', idOrden, detalle);
+    await pool.execute(
+      `UPDATE pagos_paypal SET estado = 'fallida', detalle = ? WHERE id_orden = ?`,
+      [detalle, idOrden]
+    );
+    return res.send(paginaPago('Pago rechazado', 'PayPal no pudo completar el cobro. No se te cobró nada.', false));
+  }
+  const referencia = String(captura.id).slice(0, 24);
+  await pool.execute(
+    `INSERT INTO compras (id_usuario, id_producto, monto, metodo, ultimos4, referencia, estado)
+     VALUES (?, ?, ?, ?, '0000', ?, 'aprobada')`,
+    [pago.id_usuario, pago.id_producto, pago.monto_hnl, pago.metodo, referencia]
+  );
+  await pool.execute(
+    `UPDATE pagos_paypal SET estado = 'completada', referencia = ? WHERE id_orden = ?`,
+    [referencia, idOrden]
+  );
+  res.send(paginaPago('¡Pago aprobado!', `Referencia de PayPal: ${referencia}`, true));
+}));
+
+app.get('/api/paypal/cancelado', ah(async (req, res) => {
+  await pool.execute(
+    `UPDATE pagos_paypal SET estado = 'cancelada' WHERE id_orden = ? AND estado = 'creada'`,
+    [String(req.query.token || '')]
+  );
+  res.send(paginaPago('Pago cancelado', 'Cancelaste el pago. No se te cobró nada.', false));
+}));
+
+// La app pregunta aquí cómo va su pago.
+app.get('/api/paypal/orden/:id', auth, ah(async (req, res) => {
+  const [filas] = await pool.execute(
+    `SELECT pp.estado, pp.referencia, pp.metodo, pp.monto_hnl, pp.monto_usd, p.nombre
+       FROM pagos_paypal pp JOIN productos p ON p.id_producto = pp.id_producto
+      WHERE pp.id_orden = ? AND pp.id_usuario = ?`,
+    [req.params.id, req.user.id]
+  );
+  if (filas.length === 0) return res.status(404).json({ mensaje: 'Pago no encontrado' });
+  const f = filas[0];
+  res.json({
+    estado: f.estado, referencia: f.referencia, metodo: f.metodo,
+    producto: f.nombre, monto: Number(f.monto_hnl), montoUsd: Number(f.monto_usd),
   });
 }));
 
