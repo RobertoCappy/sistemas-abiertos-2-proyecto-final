@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../services/api_service.dart';
+import '../widgets/admin_ai_chat.dart';
 import '../widgets/ui_kit.dart';
 
 /// Muestra en la app las métricas que calcula el servidor Rocky Linux.
@@ -182,6 +183,13 @@ class _ServerStatsScreenState extends State<ServerStatsScreen> {
                   ),
                 ],
               ),
+              const SizedBox(height: 22),
+              const SectionTitle(
+                icon: Icons.auto_awesome,
+                text: 'Asistente de IA',
+              ),
+              const SizedBox(height: 12),
+              const AdminAiChat(),
               const SizedBox(height: 22),
               const SectionTitle(
                 icon: Icons.bar_chart_rounded,
