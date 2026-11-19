@@ -746,10 +746,21 @@ async function obtenerMetricas() {
     `SELECT modo, COUNT(*) AS jugadas, COALESCE(SUM(resultado = 'ganada'), 0) AS ganadas
        FROM partidas GROUP BY modo`
   );
+  const [ultimas] = await pool.query(
+    `SELECT resultado FROM partidas ORDER BY id_partida DESC LIMIT 10`
+  );
+  let pagosFallidos = 0;
+  try {
+    const [[pf]] = await pool.query(
+      `SELECT COUNT(*) AS total FROM pagos_paypal
+        WHERE estado = 'fallida' AND fecha_creada >= NOW() - INTERVAL 1 DAY`
+    );
+    pagosFallidos = Number(pf.total || 0);
+  } catch (_) { /* la tabla de PayPal aún no existe */ }
   const totalMB = Math.round(os.totalmem() / 1048576);
   const libreMB = Math.round(os.freemem() / 1048576);
   const n = (v) => Number(v || 0);
-  return {
+  const metricas = {
     usuarios: n(u.total),
     partidas: {
       total: n(p.total),
@@ -787,6 +798,74 @@ async function obtenerMetricas() {
     },
     generado: new Date().toISOString(),
   };
+  metricas.alertas = calcularAlertas(metricas, {
+    ultimas: ultimas.map((f) => f.resultado),
+    pagosFallidos,
+  });
+  return metricas;
+}
+
+// ---------- Alertas del panel ----------
+// Reglas sencillas que revisan las métricas cada vez que el panel se actualiza
+// (cada 5 segundos). No gastan IA: la IA solo se usa si el administrador pide
+// un consejo sobre las alertas.
+function calcularAlertas(m, { ultimas, pagosFallidos }) {
+  const alertas = [];
+  const s = m.servidor;
+  const usoMemoria = s.memoriaTotalMB ? 1 - s.memoriaLibreMB / s.memoriaTotalMB : 0;
+  if (usoMemoria >= 0.85) {
+    alertas.push({
+      nivel: 'alta',
+      titulo: 'Memoria del servidor casi llena',
+      detalle: `Rocky está usando el ${Math.round(usoMemoria * 100)}% de la memoria RAM.`,
+    });
+  }
+  if (s.cargaCpu > s.cpus) {
+    alertas.push({
+      nivel: 'alta',
+      titulo: 'Procesador muy ocupado',
+      detalle: `La carga del CPU es ${s.cargaCpu} y el servidor tiene ${s.cpus} procesadores.`,
+    });
+  }
+  if (!s.iaConfigurada) {
+    alertas.push({
+      nivel: 'media',
+      titulo: 'La IA no está configurada',
+      detalle: 'Falta GEMINI_API_KEY en el archivo .env; se usan los datos guardados.',
+    });
+  }
+  for (const nv of m.porNivel) {
+    if (nv.jugadas >= 5 && nv.ganadas / nv.jugadas < 0.3) {
+      alertas.push({
+        nivel: 'media',
+        titulo: `El Nivel ${nv.nivel} parece muy difícil`,
+        detalle: `Solo se ganó ${nv.ganadas} de ${nv.jugadas} partidas (${Math.round((100 * nv.ganadas) / nv.jugadas)}%).`,
+      });
+    }
+  }
+  const derrotas = ultimas.filter((r) => r === 'perdida').length;
+  if (ultimas.length >= 5 && derrotas >= Math.ceil(ultimas.length * 0.8)) {
+    alertas.push({
+      nivel: 'media',
+      titulo: 'Muchas derrotas seguidas',
+      detalle: `${derrotas} de las últimas ${ultimas.length} partidas terminaron en derrota.`,
+    });
+  }
+  if (pagosFallidos > 0) {
+    alertas.push({
+      nivel: 'media',
+      titulo: 'Pagos rechazados por PayPal',
+      detalle: `${pagosFallidos} pago(s) no se completaron en las últimas 24 horas.`,
+    });
+  }
+  if (m.usuarios > 0 && m.partidasPorDia.length === 0) {
+    alertas.push({
+      nivel: 'baja',
+      titulo: 'Nadie ha jugado esta semana',
+      detalle: 'No hay partidas en los últimos 7 días.',
+    });
+  }
+  return alertas;
 }
 
 app.get('/api/metricas', auth, soloAdmin, ah(async (req, res) => {
@@ -823,6 +902,49 @@ app.post('/api/ia/admin/preguntar', auth, soloAdmin, ah(async (req, res) => {
     return res.status(503).json({ mensaje: 'La IA está ocupada en este momento, intenta de nuevo en unos segundos' });
   }
   res.json({ respuesta, generado: metricas.generado });
+}));
+
+// ---------- Consejos de la IA para el jugador ----------
+// Al terminar una partida, la app pide un consejo. El servidor lee de MySQL las
+// últimas partidas de ESE jugador y Gemini le da un consejo corto y personal.
+// Si la IA no responde, se usa un consejo armado con reglas sencillas.
+function consejoDeRespaldo(ultima, partidas) {
+  if (!ultima) return '¡Juega tu primera partida! Empieza por el Nivel 1 para conocer los símbolos.';
+  if (ultima.resultado === 'ganada') {
+    const ganadas = partidas.filter((x) => x.resultado === 'ganada').length;
+    return ganadas >= 3
+      ? '¡Vas muy bien! Intenta el siguiente nivel o gana con menos movidas para subir tu puntaje.'
+      : '¡Bien hecho! Para más puntos, termina más rápido: cada segundo que te sobra suma.';
+  }
+  if (ultima.parejas_encontradas < ultima.num_parejas / 2) {
+    return 'Destapa las cartas de una fila a la vez y repite en tu mente lo que viste; así es más fácil recordar.';
+  }
+  return '¡Te faltó poco! Cuando veas una carta que ya apareció, busca su pareja de inmediato.';
+}
+
+app.get('/api/ia/jugador/consejo', auth, ah(async (req, res) => {
+  const [partidas] = await pool.execute(
+    `SELECT p.id_nivel AS nivel, p.resultado, p.puntaje, p.intentos, p.parejas_encontradas,
+            p.duracion_seg, p.modo, n.num_parejas, n.tiempo_limite_seg, n.dificultad
+       FROM partidas p JOIN niveles n ON n.id_nivel = p.id_nivel
+      WHERE p.id_usuario = ?
+      ORDER BY p.id_partida DESC LIMIT 10`,
+    [req.user.id]
+  );
+  const ultima = partidas[0];
+  const respaldo = consejoDeRespaldo(ultima, partidas);
+  if (!ultima || !iaConfigurada()) return res.json({ consejo: respaldo, ia: false });
+
+  const prompt =
+    'Eres el entrenador amigable del juego de memoria "Memory Honduras", para estudiantes. ' +
+    'Abajo están las últimas partidas de un jugador (la primera es la que acaba de terminar). ' +
+    'Cada partida tiene: nivel, resultado, puntaje, intentos (movidas), parejas encontradas de ' +
+    'cuántas había (num_parejas), duración y tiempo límite en segundos.\n' +
+    'Dale UN consejo práctico y motivador para mejorar, basado en esos números. ' +
+    'Máximo 30 palabras, en español, hablándole de "tú", sin Markdown, sin saludar y sin comillas.\n\n' +
+    `PARTIDAS:\n${JSON.stringify(partidas)}`;
+  const consejo = await llamarGemini(prompt, { temperatura: 0.8, maxTokens: 400, esperaMs: 10000 });
+  res.json(consejo ? { consejo, ia: true } : { consejo: respaldo, ia: false });
 }));
 
 app.get('/', (req, res) => res.redirect('/panel'));

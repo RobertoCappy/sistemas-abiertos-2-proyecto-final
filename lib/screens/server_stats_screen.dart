@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../services/api_service.dart';
 import '../widgets/admin_ai_chat.dart';
+import '../widgets/admin_alerts.dart';
 import '../widgets/ui_kit.dart';
 
 /// Muestra en la app las métricas que calcula el servidor Rocky Linux.
@@ -183,6 +184,13 @@ class _ServerStatsScreenState extends State<ServerStatsScreen> {
                   ),
                 ],
               ),
+              const SizedBox(height: 22),
+              const SectionTitle(
+                icon: Icons.notifications_active_rounded,
+                text: 'Alertas',
+              ),
+              const SizedBox(height: 12),
+              AdminAlerts(alertas: d['alertas'] as List? ?? const []),
               const SizedBox(height: 22),
               const SectionTitle(
                 icon: Icons.auto_awesome,
