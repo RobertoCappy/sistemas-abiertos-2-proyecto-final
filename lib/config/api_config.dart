@@ -9,7 +9,11 @@
 class ApiConfig {
   static const String _definida = String.fromEnvironment(
     'API_URL',
-    defaultValue: 'http://192.168.1.42:3000',
+    // Dirección pública y fija del servidor Rocky (ngrok). Con esto, al
+    // presionar Run en Android Studio o al crear el APK, la app ya se conecta
+    // sin escribir nada más. Para usar otro servidor:
+    // --dart-define=API_URL=http://IP:3000
+    defaultValue: 'https://little-regain-coyness.ngrok-free.dev',
   );
 
   static String get baseUrl =>
