@@ -54,7 +54,11 @@ class ApiService {
   }
 
   Future<Map<String, String>> _headers(bool auth) async {
-    final headers = <String, String>{'Content-Type': 'application/json'};
+    final headers = <String, String>{
+      'Content-Type': 'application/json',
+      // Evita la página de aviso de ngrok (versión gratis) en las peticiones.
+      'ngrok-skip-browser-warning': '1',
+    };
     if (auth) {
       final token = await getToken();
       if (token != null) headers['Authorization'] = 'Bearer $token';

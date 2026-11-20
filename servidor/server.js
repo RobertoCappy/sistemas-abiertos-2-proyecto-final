@@ -24,6 +24,9 @@ const pool = mysql.createPool({
 });
 
 const app = express();
+// Detrás de ngrok la conexión llega como http, pero el usuario usa https.
+// Con esto Express usa el protocolo y la dirección reales (sirve para PayPal).
+app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json({ limit: '100kb' }));
 
@@ -947,7 +950,14 @@ app.get('/api/ia/jugador/consejo', auth, ah(async (req, res) => {
   res.json(consejo ? { consejo, ia: true } : { consejo: respaldo, ia: false });
 }));
 
-app.get('/', (req, res) => res.redirect('/panel'));
+// ---------- La app web (Flutter) servida desde Rocky ----------
+// Si existe la carpeta app_web (la app compilada con "flutter build web"),
+// el servidor la entrega en /juego/. Así, con un solo enlace de ngrok, los
+// jugadores abren el juego desde internet sin instalar nada.
+const carpetaApp = path.join(__dirname, 'app_web');
+const hayAppWeb = () => require('fs').existsSync(path.join(carpetaApp, 'index.html'));
+app.use('/juego', express.static(carpetaApp));
+app.get('/', (req, res) => res.redirect(hayAppWeb() ? '/juego/' : '/panel'));
 app.get('/panel', (req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'panel.html'))
 );
